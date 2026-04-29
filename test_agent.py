@@ -1,127 +1,232 @@
 """
-End-to-end agent test — exercises all components without requiring API keys.
-Simulates the orchestrator flow with a mock LLM for unit verification,
-and tests real browser + terminal tools.
+AI Orchestrator Agent — pytest test suite.
+
+Run with:
+    pytest test_agent.py -v
+
+Tests are split into marks:
+  - unit        : no network, no server needed
+  - integration : hits live internet (browser tests)
+  - server      : requires a running FastAPI server on localhost:8000
+
+Skip slow/external tests:
+    pytest test_agent.py -v -m "not integration and not server"
 """
-import sys, os, logging
-sys.path.insert(0, os.path.dirname(__file__))
+import json
+import subprocess
+import sys
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+import pytest
 
-from tools.browser_tool import run_browser_search
-from tools.terminal_tool import run_command
+# ---------------------------------------------------------------------------
+# Terminal Tool — unit tests (no network, no server)
+# ---------------------------------------------------------------------------
 
-PASS = "✅ PASS"
-FAIL = "❌ FAIL"
+class TestTerminalTool:
+    def setup_method(self):
+        # Import here so pytest collection doesn't fail if deps are missing
+        from tools.terminal_tool import run_command, is_safe_command
+        self.run_command = run_command
+        self.is_safe_command = is_safe_command
 
-results = []
+    def test_basic_execution(self):
+        r = self.run_command("echo hello")
+        assert r["success"], f"Expected success, got: {r}"
+        assert "hello" in r["stdout"]
 
-def check(label, condition, detail=""):
-    status = PASS if condition else FAIL
-    print(f"  {status} | {label}" + (f" — {detail}" if detail else ""))
-    results.append(condition)
+    def test_stdout_and_version(self):
+        r = self.run_command("python3 --version")
+        assert r["success"]
+        assert "Python 3" in r["stdout"] or "Python 3" in r["stderr"]
 
-print("\n" + "="*60)
-print(" AI ORCHESTRATOR AGENT — FULL TEST SUITE")
-print("="*60)
+    def test_safety_blocks_rm_rf(self):
+        r = self.run_command("rm -rf /")
+        assert not r["success"]
+        assert "blocked" in r.get("error", "").lower()
 
-# ── 1. Terminal Tool ──────────────────────────────────────────────────────────
-print("\n[1] Terminal Tool")
-r = run_command("echo 'Hello from AI Orchestrator' && python3 --version")
-check("command execution", r["success"])
-check("stdout captured", "Hello from AI Orchestrator" in r["stdout"])
-check("python version in output", "Python 3" in r["stdout"])
+    def test_safety_blocks_uppercase(self):
+        """Blocklist must be case-insensitive."""
+        safe, reason = self.is_safe_command("RM -RF /")
+        assert not safe
 
-r2 = run_command("rm -rf /")
-check("safety filter blocks rm -rf /", not r2["success"] and "blocked" in r2.get("error",""))
+    def test_safety_blocks_extra_spaces(self):
+        """Blocklist must survive collapsed whitespace."""
+        safe, reason = self.is_safe_command("rm  -rf  /")
+        assert not safe
 
-r3 = run_command("sleep 100", timeout=2)
-check("timeout respected", not r3["success"] and "timed out" in r3.get("error",""))
+    def test_timeout_respected(self):
+        r = self.run_command("sleep 100", timeout=2)
+        assert not r["success"]
+        assert "timed out" in r.get("error", "").lower()
 
-# ── 2. Browser Tool ───────────────────────────────────────────────────────────
-print("\n[2] Browser Tool")
-br = run_browser_search("https://example.com")
-check("browser loads example.com", br["success"])
-check("title returned", "Example" in br.get("title",""))
-check("snippet returned", len(br.get("snippet","")) > 10)
+    def test_nonzero_exit_code(self):
+        r = self.run_command("false")   # always exits 1
+        assert not r["success"]
+        assert r["returncode"] == 1
 
-br2 = run_browser_search("https://en.wikipedia.org/wiki/Artificial_intelligence")
-check("browser loads Wikipedia AI page", br2["success"])
-check("AI content in snippet", "artificial" in br2.get("snippet","").lower() or "intelligence" in br2.get("snippet","").lower())
+    def test_invalid_command(self):
+        r = self.run_command("this_command_does_not_exist_xyz")
+        assert not r["success"]
 
-# ── 3. API Server (health check) ─────────────────────────────────────────────
-print("\n[3] FastAPI Server")
-import subprocess, json, time
-r_health = subprocess.run(["curl","-s","http://localhost:8000/health"], capture_output=True, text=True, timeout=5)
-try:
-    health = json.loads(r_health.stdout)
-    check("health endpoint returns 200", health.get("status") == "healthy")
-except:
-    check("health endpoint returns 200", False, r_health.stdout[:80])
+    def test_stdout_limit(self):
+        """stdout should be capped at OUTPUT_LIMIT chars."""
+        from tools.terminal_tool import OUTPUT_LIMIT
+        r = self.run_command(f"python3 -c \"print('x' * {OUTPUT_LIMIT * 2})\"")
+        assert len(r.get("stdout", "")) <= OUTPUT_LIMIT
 
-r_root = subprocess.run(["curl","-s","http://localhost:8000/"], capture_output=True, text=True, timeout=5)
-try:
-    root = json.loads(r_root.stdout)
-    check("root endpoint returns service name", root.get("service") == "AI Orchestrator Agent")
-except:
-    check("root endpoint returns service name", False)
 
-r_hist = subprocess.run(["curl","-s","http://localhost:8000/history"], capture_output=True, text=True, timeout=5)
-try:
-    hist = json.loads(r_hist.stdout)
-    check("history endpoint returns list", "history" in hist)
-except:
-    check("history endpoint returns list", False)
+# ---------------------------------------------------------------------------
+# Browser Tool — integration tests (live internet)
+# ---------------------------------------------------------------------------
 
-# ── 4. LLM Abstraction ───────────────────────────────────────────────────────
-print("\n[4] LLM Abstraction Layer")
-from agent.llm_abstraction import get_llm
-try:
-    llm = get_llm("anthropic")
-    check("anthropic llm initialized", True, type(llm).__name__)
-except Exception as e:
-    check("anthropic llm initialized", False, str(e)[:60])
+@pytest.mark.integration
+class TestBrowserTool:
+    def setup_method(self):
+        from tools.browser_tool import run_browser_search
+        self.run_browser_search = run_browser_search
 
-try:
-    llm2 = get_llm("openai")
-    check("openai llm initialized", True, type(llm2).__name__)
-except Exception as e:
-    check("openai llm initialized (no key — expected)", True, str(e)[:60])
+    def test_loads_direct_url(self):
+        r = self.run_browser_search("https://example.com")
+        assert r["success"], f"Browser failed: {r.get('error')}"
+        assert "Example" in r.get("title", "")
+        assert len(r.get("snippet", "")) > 10
 
-try:
-    get_llm("badprovider")
-    check("invalid provider raises error", False)
-except ValueError:
-    check("invalid provider raises error", True)
+    def test_search_query(self):
+        r = self.run_browser_search("AI agents Wikipedia")
+        assert r["success"], f"Search failed: {r.get('error')}"
+        assert r.get("snippet"), "Expected non-empty snippet"
 
-# ── 5. Safety Filter in Orchestrator ─────────────────────────────────────────
-print("\n[5] Orchestrator Safety Filter")
-from agent.orchestrator import OrchestratorAgent
+    def test_loads_wikipedia(self):
+        r = self.run_browser_search("https://en.wikipedia.org/wiki/Artificial_intelligence")
+        assert r["success"]
+        snippet_lower = r.get("snippet", "").lower()
+        assert "intelligence" in snippet_lower or "artificial" in snippet_lower
 
-class MockAgent(OrchestratorAgent):
-    def _init_agent(self):
-        pass  # Skip real LLM init for safety-filter test
 
-agent = MockAgent.__new__(MockAgent)
-agent.history = []
-agent.provider = "mock"
-agent.max_retries = 1
-agent.SAFETY_BLOCKLIST = OrchestratorAgent.SAFETY_BLOCKLIST
+# ---------------------------------------------------------------------------
+# LLM Abstraction — unit tests (no API calls made)
+# ---------------------------------------------------------------------------
 
-for bad in ["drop table users", "DELETE FROM accounts", "shutdown -h now"]:
-    result = agent._is_safe(bad)
-    check(f"blocks: '{bad[:20]}'", result is not None)
+class TestLLMAbstraction:
+    def setup_method(self):
+        from agent.llm_abstraction import get_llm
+        self.get_llm = get_llm
 
-check("allows: 'search for AI agents'", agent._is_safe("search for AI agents") is None)
+    def test_invalid_provider_raises(self):
+        with pytest.raises(ValueError, match="Unknown LLM provider"):
+            self.get_llm("badprovider")
 
-# ── Summary ───────────────────────────────────────────────────────────────────
-print("\n" + "="*60)
-total = len(results)
-passed = sum(results)
-print(f" RESULTS: {passed}/{total} tests passed")
-if passed == total:
-    print(" 🎉 ALL TESTS PASSED — System fully functional!")
-else:
-    print(f" ⚠️  {total - passed} test(s) failed")
-print("="*60 + "\n")
-sys.exit(0 if passed == total else 1)
+    def test_missing_anthropic_key_raises(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        with pytest.raises(EnvironmentError, match="ANTHROPIC_API_KEY"):
+            self.get_llm("anthropic")
+
+    def test_missing_openai_key_raises(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        with pytest.raises(EnvironmentError, match="OPENAI_API_KEY"):
+            self.get_llm("openai")
+
+    def test_anthropic_object_created(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+        from langchain_anthropic import ChatAnthropic
+        llm = self.get_llm("anthropic")
+        assert isinstance(llm, ChatAnthropic)
+
+    def test_openai_object_created(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        from langchain_openai import ChatOpenAI
+        llm = self.get_llm("openai")
+        assert isinstance(llm, ChatOpenAI)
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator Safety Filter — unit tests (no LLM initialised)
+# ---------------------------------------------------------------------------
+
+class TestOrchestratorSafety:
+    """Tests _is_safe() directly without spinning up an LLM."""
+
+    def _make_agent(self):
+        from agent.orchestrator import OrchestratorAgent, _SAFETY_PATTERNS
+        class _Mock(OrchestratorAgent):
+            def _init_agent(self): pass  # skip LLM init
+        obj = _Mock.__new__(_Mock)
+        obj.history = []
+        obj.provider = "mock"
+        obj.max_retries = 1
+        return obj
+
+    def test_blocks_drop_table(self):
+        agent = self._make_agent()
+        assert agent._is_safe("DROP TABLE users") is not None
+
+    def test_blocks_delete_from(self):
+        agent = self._make_agent()
+        assert agent._is_safe("DELETE FROM accounts") is not None
+
+    def test_blocks_shutdown(self):
+        agent = self._make_agent()
+        assert agent._is_safe("shutdown -h now") is not None
+
+    def test_blocks_rm_rf(self):
+        agent = self._make_agent()
+        assert agent._is_safe("please run rm -rf /") is not None
+
+    def test_allows_normal_prompt(self):
+        agent = self._make_agent()
+        assert agent._is_safe("Search for the latest AI news") is None
+
+    def test_allows_code_question(self):
+        agent = self._make_agent()
+        assert agent._is_safe("write a python function to sort a list") is None
+
+
+# ---------------------------------------------------------------------------
+# FastAPI Server — integration tests (requires running server)
+# ---------------------------------------------------------------------------
+
+def _server_running() -> bool:
+    try:
+        result = subprocess.run(
+            ["curl", "-s", "--max-time", "2", "http://localhost:8000/health"],
+            capture_output=True, text=True, timeout=5,
+        )
+        data = json.loads(result.stdout)
+        return data.get("status") == "healthy"
+    except Exception:
+        return False
+
+
+@pytest.mark.server
+@pytest.mark.skipif(not _server_running(), reason="FastAPI server not running on localhost:8000")
+class TestAPIServer:
+    def _get(self, path: str) -> dict:
+        r = subprocess.run(
+            ["curl", "-s", f"http://localhost:8000{path}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return json.loads(r.stdout)
+
+    def test_root_endpoint(self):
+        data = self._get("/")
+        assert data["service"] == "AI Orchestrator Agent"
+
+    def test_health_endpoint(self):
+        data = self._get("/health")
+        assert data["status"] == "healthy"
+        assert "timestamp" in data
+
+    def test_history_endpoint(self):
+        data = self._get("/history")
+        assert "history" in data
+
+    def test_run_rejects_empty_prompt(self):
+        r = subprocess.run(
+            ["curl", "-s", "-X", "POST", "http://localhost:8000/run",
+             "-H", "Content-Type: application/json",
+             "-d", '{"prompt": ""}'],
+            capture_output=True, text=True, timeout=10,
+        )
+        data = json.loads(r.stdout)
+        # Pydantic validation should return 422
+        assert "detail" in data

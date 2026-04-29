@@ -1,16 +1,19 @@
 """
-AI Orchestrator Agent (LangGraph-based ReAct, compatible with langchain v1.x)
-- LangGraph create_react_agent (replaces deprecated langchain AgentExecutor)
-- Browser + Terminal tools
-- In-memory conversation history
-- Retry logic + safety filters
+AI Orchestrator Agent — LangGraph ReAct agent.
+
+Fixes vs v1.0:
+- AIMessage.content guarded for list payloads (tool-use content blocks)
+- Tool step count uses isinstance(m, ToolMessage) instead of fragile .type check
+- Safety blocklist uses compiled regex for robust, case-insensitive matching
+- History window documented and enforced
 """
 import logging
+import re
 import time
 from typing import Optional
 
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage, AIMessage
 from langgraph.prebuilt import create_react_agent
 
 from agent.llm_abstraction import get_llm
@@ -20,14 +23,14 @@ from tools.terminal_tool import run_command
 logger = logging.getLogger(__name__)
 
 
-# ── LangChain Tools ──────────────────────────────────────────────────────────
+# ── LangChain Tools ───────────────────────────────────────────────────────────
 
 @tool
 def browser(query: str) -> str:
     """
-    Open a web browser and search Google or visit a URL.
-    Input: a search query string or a full URL (must start with http).
-    Returns: page title, current URL, and a text snippet.
+    Open a web browser and search the web or visit a URL.
+    Pass a plain search query (e.g. "AI agents 2025") or a full URL starting with http/https.
+    Returns: page title, current URL, and a text snippet from the page.
     """
     result = run_browser_search(query)
     if result.get("success"):
@@ -43,8 +46,9 @@ def browser(query: str) -> str:
 def terminal(command: str) -> str:
     """
     Run a safe shell command on the local machine.
-    Input: a shell command string (e.g. 'echo hello', 'ls -la', 'python3 --version').
+    Examples: 'echo hello', 'ls -la', 'python3 --version', 'cat /etc/os-release'.
     Returns: stdout, stderr, and exit code.
+    Dangerous commands (rm -rf /, mkfs, fork-bomb, etc.) are automatically blocked.
     """
     result = run_command(command)
     if not result.get("success") and "error" in result:
@@ -58,76 +62,118 @@ def terminal(command: str) -> str:
 
 TOOLS = [browser, terminal]
 
+# Compiled once at module load — matched against normalised (lowercase) prompt
+_SAFETY_PATTERNS = [re.compile(p, re.IGNORECASE) for p in [
+    r"drop\s+table",
+    r"delete\s+from",
+    r"format\s+c:",
+    r"shutdown\s+-[hrp]",
+    r"rm\s+-rf\s+/",
+    r"\bmkfs\b",
+]]
 
-# ── Orchestrator ─────────────────────────────────────────────────────────────
+# History window: keep at most this many messages to bound memory usage
+_HISTORY_WINDOW = 40
+
+
+def _extract_text(content) -> str:
+    """
+    Safely extract a plain-text string from an AIMessage content value.
+    content may be: str | list[str | dict]  (LangChain content-block format)
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+        return "\n".join(parts).strip()
+    return str(content)
+
 
 class OrchestratorAgent:
-    """Stateful agent with memory, retry logic, and safety filters."""
-
-    SAFETY_BLOCKLIST = ["drop table", "delete from", "format c:", "shutdown -h", "rm -rf /"]
+    """Stateful ReAct agent with conversation memory, retry, and safety filters."""
 
     def __init__(self, provider: str = "anthropic", max_retries: int = 3):
         self.provider = provider
         self.max_retries = max_retries
-        self.history: list = []   # list of LangChain message objects
+        self.history: list = []  # LangChain message objects, capped at _HISTORY_WINDOW
         self._init_agent()
 
     def _init_agent(self):
         llm = get_llm(self.provider)
         self.graph = create_react_agent(llm, TOOLS)
-        logger.info(f"[Orchestrator] Agent ready (provider={self.provider})")
+        logger.info(f"[Orchestrator] Agent ready (provider={self.provider!r})")
 
     def _is_safe(self, prompt: str) -> Optional[str]:
-        for blocked in self.SAFETY_BLOCKLIST:
-            if blocked.lower() in prompt.lower():
-                return f"Prompt blocked by safety filter: '{blocked}'"
+        """Return a block-reason string if the prompt matches a safety pattern, else None."""
+        for pattern in _SAFETY_PATTERNS:
+            if pattern.search(prompt):
+                return f"Prompt blocked by safety filter (matched: {pattern.pattern!r})"
         return None
 
     def run(self, prompt: str) -> dict:
-        """Execute the agent with retry and exponential back-off."""
-        blocked_reason = self._is_safe(prompt)
-        if blocked_reason:
-            return {"success": False, "output": blocked_reason}
+        """
+        Run the agent with exponential back-off retry.
 
-        last_error = None
+        Returns:
+            dict with keys: success (bool), output (str), steps (int), attempt (int)
+        """
+        blocked = self._is_safe(prompt)
+        if blocked:
+            return {"success": False, "output": blocked, "steps": 0, "attempt": 0}
+
+        last_error: Optional[str] = None
         for attempt in range(1, self.max_retries + 1):
             try:
-                logger.info(f"[Orchestrator] Attempt {attempt}/{self.max_retries}: {prompt[:80]}")
+                logger.info(
+                    f"[Orchestrator] Attempt {attempt}/{self.max_retries}: {prompt[:80]!r}"
+                )
                 messages = self.history + [HumanMessage(content=prompt)]
                 result = self.graph.invoke({"messages": messages})
 
                 all_messages = result["messages"]
-                # Last AI message is the final answer
+
+                # Extract final AI response — guard against list content blocks
                 ai_msgs = [m for m in all_messages if isinstance(m, AIMessage)]
-                output = ai_msgs[-1].content if ai_msgs else "No response generated."
-                tool_steps = sum(1 for m in all_messages if hasattr(m, "type") and m.type == "tool")
+                raw_output = ai_msgs[-1].content if ai_msgs else ""
+                output = _extract_text(raw_output) or "No response generated."
 
-                # Update memory (keep last 20 message pairs)
-                self.history = all_messages[-40:]
+                # Count tool invocations using ToolMessage (robust across LangGraph versions)
+                tool_steps = sum(1 for m in all_messages if isinstance(m, ToolMessage))
 
-                logger.info(f"[Orchestrator] Done. Steps: {tool_steps}")
-                return {
-                    "success": True,
-                    "output": output,
-                    "steps": tool_steps,
-                    "attempt": attempt,
-                }
-            except Exception as e:
-                last_error = str(e)
-                logger.error(f"[Orchestrator] Attempt {attempt} failed: {e}")
+                # Trim history to keep memory bounded
+                self.history = all_messages[-_HISTORY_WINDOW:]
+
+                logger.info(f"[Orchestrator] Done — {tool_steps} tool call(s)")
+                return {"success": True, "output": output, "steps": tool_steps, "attempt": attempt}
+
+            except Exception as exc:
+                last_error = str(exc)
+                logger.error(f"[Orchestrator] Attempt {attempt} failed: {exc}")
                 if attempt < self.max_retries:
-                    time.sleep(2 ** attempt)
+                    sleep_s = 2 ** attempt
+                    logger.info(f"[Orchestrator] Retrying in {sleep_s}s...")
+                    time.sleep(sleep_s)
 
         return {
             "success": False,
             "output": f"All {self.max_retries} attempts failed. Last error: {last_error}",
+            "steps": 0,
+            "attempt": self.max_retries,
         }
 
     def get_history(self) -> list:
-        return [
-            {"role": m.__class__.__name__, "content": m.content}
-            for m in self.history
-        ]
+        """Return conversation history as serialisable dicts."""
+        result = []
+        for m in self.history:
+            content = _extract_text(m.content)
+            result.append({"role": m.__class__.__name__, "content": content})
+        return result
 
-    def clear_history(self):
+    def clear_history(self) -> None:
         self.history = []
+        logger.info("[Orchestrator] History cleared.")

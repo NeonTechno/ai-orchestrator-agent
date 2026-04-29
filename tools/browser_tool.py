@@ -1,27 +1,34 @@
-"""Browser Tool using Playwright - headless Chromium automation"""
+"""Browser Tool — headless Chromium automation via Playwright."""
 import asyncio
 import logging
 from urllib.parse import quote_plus
+
+import nest_asyncio
 from playwright.async_api import async_playwright
+
+# Allow asyncio.run() inside an already-running event loop (e.g. FastAPI / Jupyter)
+nest_asyncio.apply()
 
 logger = logging.getLogger(__name__)
 
+# Search engines tried in order until one succeeds (bot-detection avoidance)
+_SEARCH_ENGINES = [
+    "https://html.duckduckgo.com/html/?q={q}",   # DDG HTML — no JS, low bot-detection
+    "https://www.bing.com/search?q={q}",
+]
 
-async def browser_search(query: str) -> dict:
-    """
-    Navigate to a URL or perform a web search.
-    Direct URLs (starting with http/https) are loaded as-is.
-    Text queries are searched via Bing (good bot tolerance in headless mode).
-    """
-    if query.startswith("http://") or query.startswith("https://"):
-        target_url = query
-    else:
-        target_url = f"https://www.bing.com/search?q={quote_plus(query)}"
+_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+_SNIPPET_LIMIT = 1000  # characters of visible page text returned to the agent
+_TIMEOUT_MS = 45_000
 
-    logger.info(f"[Browser] Navigating to: {target_url}")
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
+async def _fetch_page(url: str) -> dict:
+    """Core Playwright fetch. Opens a fresh browser + context per call."""
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
             headless=True,
             args=[
                 "--no-sandbox",
@@ -30,34 +37,55 @@ async def browser_search(query: str) -> dict:
             ],
         )
         context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
+            user_agent=_USER_AGENT,
             viewport={"width": 1280, "height": 800},
+            java_script_enabled=True,
         )
         page = await context.new_page()
         try:
-            await page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
-            await page.wait_for_timeout(1500)
+            await page.goto(url, wait_until="domcontentloaded", timeout=_TIMEOUT_MS)
+            await page.wait_for_timeout(1200)
             title = await page.title()
             current_url = page.url
             text = await page.evaluate("() => document.body.innerText")
-            snippet = text[:800].strip() if text else ""
-            logger.info(f"[Browser] Loaded: '{title[:50]}' | {len(snippet)} chars")
-            return {
-                "success": True,
-                "title": title,
-                "url": current_url,
-                "snippet": snippet,
-            }
-        except Exception as e:
-            logger.error(f"[Browser] Error: {e}")
-            return {"success": False, "error": str(e)}
+            snippet = (text or "").strip()[:_SNIPPET_LIMIT]
+            logger.info(f"[Browser] OK  title={title[:60]!r}  chars={len(snippet)}")
+            return {"success": True, "title": title, "url": current_url, "snippet": snippet}
+        except Exception as exc:
+            logger.error(f"[Browser] Error fetching {url!r}: {exc}")
+            return {"success": False, "error": str(exc)}
         finally:
+            # Always close context AND browser to avoid resource leaks
+            await context.close()
             await browser.close()
 
 
+async def _browser_search_async(query: str) -> dict:
+    """
+    Async entry point.
+    - If query looks like a URL, fetch it directly.
+    - Otherwise try each search engine in _SEARCH_ENGINES until one works.
+    """
+    if query.startswith(("http://", "https://")):
+        return await _fetch_page(query)
+
+    encoded = quote_plus(query)
+    last_error = "no engines tried"
+    for template in _SEARCH_ENGINES:
+        url = template.format(q=encoded)
+        logger.info(f"[Browser] Searching: {url}")
+        result = await _fetch_page(url)
+        if result.get("success"):
+            return result
+        last_error = result.get("error", "unknown")
+        logger.warning(f"[Browser] Engine failed ({url}): {last_error}")
+
+    return {"success": False, "error": f"All search engines failed. Last: {last_error}"}
+
+
 def run_browser_search(query: str) -> dict:
-    """Sync wrapper for async browser_search."""
-    return asyncio.run(browser_search(query))
+    """
+    Synchronous wrapper — safe to call from sync code AND from within a running
+    event loop (nest_asyncio handles the nesting).
+    """
+    return asyncio.run(_browser_search_async(query))
