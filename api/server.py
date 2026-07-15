@@ -10,7 +10,6 @@ from pydantic import BaseModel, field_validator
 
 from agent.orchestrator import OrchestratorAgent
 
-# ── Ensure logs directory exists BEFORE configuring file handler ──────────────
 os.makedirs("logs", exist_ok=True)
 
 logging.basicConfig(
@@ -23,14 +22,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── FastAPI app ───────────────────────────────────────────────────────────────
 app = FastAPI(
     title="AI Orchestrator Agent",
     description="LangGraph ReAct agent with browser + terminal tools (Anthropic / OpenAI)",
     version="1.1.0",
 )
 
-# CORS — allow all origins so browser clients can call the API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -39,19 +36,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Agent cache (one instance per provider, initialised lazily) ───────────────
 _agent_cache: dict[str, OrchestratorAgent] = {}
 
-
 def get_agent(provider: str = "anthropic") -> OrchestratorAgent:
-    """Return a cached OrchestratorAgent for the given provider."""
     if provider not in _agent_cache:
         logger.info(f"[Server] Initialising agent for provider={provider!r}")
         _agent_cache[provider] = OrchestratorAgent(provider=provider)
     return _agent_cache[provider]
 
 
-# ── Pydantic models ───────────────────────────────────────────────────────────
 class RunRequest(BaseModel):
     prompt: str
     provider: Optional[str] = "anthropic"
@@ -80,7 +73,6 @@ class RunResponse(BaseModel):
     provider: str = "anthropic"
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {
