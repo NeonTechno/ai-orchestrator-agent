@@ -1,11 +1,5 @@
 """
 AI Orchestrator Agent — LangGraph ReAct agent.
-
-Fixes vs v1.0:
-- AIMessage.content guarded for list payloads (tool-use content blocks)
-- Tool step count uses isinstance(m, ToolMessage) instead of fragile .type check
-- Safety blocklist uses compiled regex for robust, case-insensitive matching
-- History window documented and enforced
 """
 import logging
 import re
@@ -22,9 +16,6 @@ from tools.terminal_tool import run_command
 
 logger = logging.getLogger(__name__)
 
-
-# LangChain Tools
-
 @tool
 def browser(query: str) -> str:
     result = run_browser_search(query)
@@ -36,7 +27,6 @@ def browser(query: str) -> str:
         )
     return f"Browser error: {result.get('error', 'unknown')}"
 
-
 @tool
 def terminal(command: str) -> str:
     result = run_command(command)
@@ -47,3 +37,5 @@ def terminal(command: str) -> str:
         f"stderr: {result.get('stderr', '')}\n"
         f"exit code: {result.get('returncode', '?')}"
     )
+
+TOOLS = [browser, terminal]
