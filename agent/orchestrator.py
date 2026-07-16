@@ -58,7 +58,7 @@ def terminal(command: str) -> str:
     return (
         f"stdout: {result.get('stdout', '')}\n"
         f"stderr: {result.get('stderr', '')}\n"
-        f"exit code: {result.get('returncode', '?')}"
+        f"exit code: {result.get('returncode', '?')}"}"
     )
 
 
