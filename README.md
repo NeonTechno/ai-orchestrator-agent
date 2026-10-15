@@ -1,141 +1,77 @@
 # 🤖 AI Orchestrator Agent
 
-A production-ready, modular AI Orchestrator Agent built with **LangChain**, **LangGraph**, **Playwright**, and **FastAPI** — supporting both **Anthropic Claude** and **OpenAI GPT** backends.
+A modular AI Orchestrator Agent built with **LangChain**, **LangGraph**, **Playwright**, and **FastAPI**, supporting Anthropic Claude and OpenAI backends.
 
-Built autonomously using [Composio](https://composio.dev) tools.
+## Features
 
----
+- Dual LLM support through a provider abstraction
+- Playwright browser automation
+- Terminal command tool with timeout and output limits
+- LangGraph ReAct agent with bounded in-memory conversation history
+- FastAPI endpoints: `/run`, `/health`, and `/history`
+- Retry handling and logging
 
-## ✨ Features
-
-- **Dual LLM Support** — Anthropic Claude (default) or OpenAI GPT via a clean abstraction layer
-- **Browser Automation** — Playwright headless Chromium for real web search & navigation
-- **Terminal Tool** — Safe subprocess execution with timeout and blocklist
-- **LangGraph ReAct Agent** — Modern agentic loop with tool use and memory
-- **FastAPI Server** — REST API with `/run`, `/health`, `/history` endpoints
-- **Conversation Memory** — Maintains context across multiple requests
-- **Retry Logic** — Exponential back-off, up to 3 attempts per request
-- **Safety Filters** — Blocks dangerous shell commands and prompt injections
-- **Full Logging** — Structured logs to file and stdout
-
----
-
-## 📁 Project Structure
-
-```
-ai-orchestrator-agent/
-├── agent/
-│   ├── llm_abstraction.py    # OpenAI + Anthropic LLM factory
-│   └── orchestrator.py       # LangGraph ReAct agent with memory + retry
-├── tools/
-│   ├── browser_tool.py       # Playwright headless browser
-│   └── terminal_tool.py      # Safe shell command executor
-├── api/
-│   └── server.py             # FastAPI REST server
-├── main.py                   # Entry point
-├── test_agent.py             # 20-test suite (all passing)
-└── requirements.txt
-```
-
----
-
-## 🚀 Quick Start
-
-### 1. Install dependencies
+## Quick start
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 playwright install chromium
-```
-
-### 2. Set API keys
-
-```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
-export OPENAI_API_KEY="sk-..."       # optional, OpenAI fallback
-```
-
-### 3. Start the server
-
-```bash
+cp .env.example .env
+# Add the provider API key to your environment or .env loader.
 python main.py
-# or
-uvicorn api.server:app --host 0.0.0.0 --port 8000
 ```
 
-### 4. Run the agent
+The application currently reads environment variables directly; the `.env.example` file documents expected values but does not automatically load them. Export variables in your shell or configure your deployment environment.
 
-```bash
-curl -X POST http://localhost:8000/run \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "Open Google and search for AI agents"}'
-```
-
----
-
-## 🔌 API Endpoints
+## API endpoints
 
 | Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/` | Service info |
-| `GET` | `/health` | Health check |
-| `POST` | `/run` | Run agent with a prompt |
-| `GET` | `/history` | Get conversation history |
-| `DELETE` | `/history` | Clear conversation history |
+|---|---|---|
+| GET | `/` | Service info |
+| GET | `/health` | Minimal health check |
+| POST | `/run` | Run an agent prompt |
+| GET | `/history` | Read provider conversation history |
+| DELETE | `/history` | Clear provider conversation history |
 
-### Example `/run` request
-
-```json
-{
-  "prompt": "Search for the latest news on AI agents and summarize",
-  "provider": "anthropic"
-}
-```
-
-### Example response
-
-```json
-{
-  "success": true,
-  "output": "Here are the latest developments in AI agents...",
-  "steps": 3,
-  "attempt": 1,
-  "elapsed_seconds": 8.4
-}
-```
-
----
-
-## 🛡️ Safety
-
-- Dangerous shell commands (`rm -rf /`, etc.) are blocked by the terminal tool
-- Malicious prompt patterns blocked at orchestrator level
-- All commands run with configurable timeouts
-
----
-
-## 🧪 Tests
+Example:
 
 ```bash
-python test_agent.py
+curl -X POST http://127.0.0.1:8000/run \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $ORCHESTRATOR_API_KEY" \
+  -d '{"prompt":"Search for recent AI agent research","provider":"anthropic"}'
 ```
 
-**20/20 tests passing** — covers terminal tool, browser tool, API endpoints, LLM abstraction, and safety filters.
+## Security configuration
 
----
+- Set `APP_ENV=production` and a strong random `ORCHESTRATOR_API_KEY` before exposing the service. In production, the service fails closed if the key is missing.
+- Send the key using the `X-API-Key` header to `/run` and `/history`.
+- Configure `CORS_ALLOWED_ORIGINS` as a comma-separated list of exact trusted browser origins. The default only permits localhost development origins.
+- `/health` is intentionally public and returns only a minimal status and timestamp.
+- `MAX_PROMPT_LENGTH` limits prompt size (default 12,000 characters).
+- Do not log or commit provider keys. The `.env.example` file contains placeholders only.
+- API-key authentication does **not** sandbox the terminal tool. Do not expose this service to untrusted networks until terminal execution and browser access have been independently reviewed and isolated. A command blocklist alone is not a security boundary.
 
-## 🏗️ Tech Stack
+For local development, `APP_ENV` defaults to `development`, where API-key authentication is optional. This mode is not suitable for a publicly accessible deployment.
 
-| Component | Technology |
-|-----------|-----------|
-| LLM Backend | Anthropic Claude / OpenAI GPT |
-| Agent Framework | LangChain + LangGraph |
-| Browser Automation | Playwright (Chromium) |
-| API Server | FastAPI + Uvicorn |
-| Orchestration | Composio |
+## Tests
 
----
+```bash
+pytest -q
+```
 
-## 📄 License
+The repository includes the original `test_agent.py` suite and focused API security regression tests under `tests/`. Run the suite in a configured development environment; tests have not been executed as part of this repository edit.
 
-MIT — built by [NeonTechno](https://github.com/NeonTechno) / Decentralized Rights Protocol
+## Technology
+
+- Python
+- LangChain and LangGraph
+- FastAPI and Uvicorn
+- Playwright / Chromium
+- Anthropic and OpenAI SDK integrations
+
+## License
+
+MIT — NeonTechno / Decentralized Rights Protocol.
